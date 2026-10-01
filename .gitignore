@@ -1,0 +1,8 @@
+results/
+*.pyc
+__pycache__/
+venv/
+.venv/
+i5/
+i9/
+275hx/

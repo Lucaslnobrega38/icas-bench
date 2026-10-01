@@ -1,0 +1,188 @@
+================================================================================
+  METODOLOGIA DE BENCHMARKING — sched-bench
+  Avaliação do Intel Thread Director (ITD) com o mecanismo ICAS (patches IPCC
+  de Ricardo Neri, portados para Linux 7.0.0-rc1)
+================================================================================
+
+Este documento descreve o que run_battery.sh e os scripts em benchmarks/battery/
+realmente fazem hoje. Não descreve fases descontinuadas (latência com schbench/
+cyclictest/hackbench/perf-bench-pipe, energia via RAPL, overhead de scheduler):
+elas existiram em versões anteriores do script e foram removidas do código.
+
+
+1. OBJETIVO
+-----------
+Medir se o ICAS (classes IPCC do Intel Thread Director usadas como tiebreaker
+no balanceador de carga do CFS) muda o placement e o throughput de tarefas
+híbridas, comparado a um kernel que só conhece prioridade de core (ITMT/
+asym_packing).
+
+Questões centrais:
+  - O scheduler coloca tarefas cls2 (vetorizadas) nos P-cores preferencialmente?
+  - Há ganho de throughput para workloads cls2 sob contenção?
+  - Um oráculo com tarefas presas por taskset (sem depender do scheduler)
+    estabelece que teto de placement/throughput é alcançável?
+
+
+2. PLATAFORMAS
+---------------
+  i5-1334U (Raptor Lake-U): 2 P-cores físicos (4 threads com Hyper-Threading,
+    CPU 0-3) + 8 E-cores (CPU 4-11) = 12 CPUs lógicas.
+  i9-14900HX (Raptor Lake-HX): 8 P-cores físicos (16 threads com HT,
+    CPU 0-15) + 16 E-cores (CPU 16-31) = 32 CPUs lógicas.
+
+  A topologia é detectada em tempo de execução via
+  /sys/devices/system/cpu/cpuN/acpi_cppc/highest_perf (>50 = P-core) e
+  /sys/devices/system/cpu/cpuN/topology/core_id (para agrupar threads de um
+  mesmo P-core físico). Não há valor fixo de topologia no código.
+
+  Kernels comparados (todos Linux 7.0.0-rc1, branches diferentes):
+    vanilla_smt / vanilla_nosmt — ITMT/asym_packing ativo, sem IPCC (baseline)
+    orig_smt    / orig_nosmt    — baseline + ICAS (patches de Neri, sem
+                                   modificação)
+    oracle_smt                  — kernel vanilla, tarefas presas por taskset
+                                   (--oracle-pin); mede o teto de placement/
+                                   throughput independente do scheduler
+    custom_smt                  — variante com heurística própria (EWMA de
+                                   classe por tarefa); fora do escopo do artigo
+                                   atual, mantida para trabalho futuro
+
+  "_smt"/"_nosmt" é só o rótulo do diretório de saída (--outdir); o script não
+  liga/desliga SMT sozinho — isso é feito manualmente antes de cada rodada:
+    echo off | sudo tee /sys/devices/system/cpu/smt/control   # desligar
+    echo on  | sudo tee /sys/devices/system/cpu/smt/control   # religar
+  Sempre conferir no run.log resultante (P-cores lógicos, Total CPUs) que a
+  topologia bate com o rótulo escolhido — já aconteceu de duas rodadas saírem
+  trocadas por SMT não ter sido alternado no momento certo.
+
+
+3. CLASSES IPCC (ITD)
+----------------------
+Ver docs/ipcc_classes_behavior.txt para a caracterização empírica completa
+(estabilidade, mapeamento de 82 métodos do stress-ng, efeito do sibling HT,
+deltas de throughput P-core vs E-core). Resumo:
+
+  Scheduler (ipcc)  Hardware  Significado
+  ----------------  --------  --------------------------------------------
+  0                 —         Unclassified (nunca avaliada, ou em E-core)
+  1                 0         Non-vectorized integer/FP (ultra-estável)
+  2                 1         Vectorized, exceto DL Boost (instável, ~95%
+                               do tempo na classe dominante)
+  3                 2         DL Boost (não observada nos testes deste doc)
+  4                 3         pause / spin-wait
+
+Workloads usados na bateria:
+  stress-ng --cpu-method rand48  → classe 2, maior afinidade a P-core medida
+                                    (P/E = 3.03x, ver docs/ipcc_classes_behavior.txt)
+  stress-ng --cpu-method div16   → classe 1, ultra-estável, afinidade a
+                                    P-core mais modesta (P/E = 1.35x)
+
+
+4. FASES DO run_battery.sh
+----------------------------
+
+4.1 PLACEMENT (fase "placement")
+  Mede onde o scheduler coloca cada classe. Polling de /proc/PID/stat
+  (campo 39, CPU atual) a cada 100ms, por 30s, sobre os PIDs dos workers.
+  Métricas: cls2_p_residency (% do tempo que tarefas cls2 passam em P-core)
+  e cls1_e_residency (% do tempo que tarefas cls1 passam em E-core).
+
+  Cenários (script: benchmarks/battery/placement.sh):
+    relaxed    : N cls2 (rand48) + N cls1 (div16), N = P-cores físicos
+                 (2 no i5, 8 no i9)
+    contention : N cls2 + M cls1, M = CPUs lógicas totais − N (i5: 12
+                 tarefas; i9: 32) — mesmo N/M com ou sem SMT, então nosmt
+                 fica sobre-inscrito (menos CPUs online, mesma carga)
+
+  Runs efetivos = 2 × --runs (o script dobra internamente: --runs 50 dá
+  100 corridas de placement no i5, --runs 100 dá 200 no i9).
+
+4.2 THROUGHPUT (fase "throughput")
+  Mede a vazão média por worker cls2 (bogo-ops/s, tempo real) sob contenção.
+  Cenário único, "c2_contention" (script: benchmarks/battery/throughput.sh):
+  nproc --all / 2 tarefas cls2 + nproc --all / 2 tarefas cls1 (i5: 6+6, i9:
+  16+16), cada uma um processo stress-ng --cpu 1 próprio, por
+  THROUGHPUT_DURATION segundos (padrão 10s, curto o bastante para estabilizar
+  sem gastar tempo demais). A métrica é a média das linhas "bogo ops/s (real
+  time)" só dos workers cls2 — não a soma de um único stress-ng --cpu N como
+  em versões anteriores.
+
+  THROUGHPUT_LAUNCH controla a ordem de lançamento:
+    together (padrão) — todas as tarefas juntas, intercaladas cls2/cls1
+    bg_first           — cls1 entra 0.3s antes dos cls2 (comportamento antigo;
+                          deixa os cls2 herdarem as CPUs que sobrarem)
+
+  Runs efetivos = 2 × --runs, como o placement.
+
+4.3 --oracle-pin (ambas as fases)
+  Em vez de deixar o scheduler decidir, cada tarefa é presa a uma CPU
+  própria via taskset. cls2 recebe prioridade de preenchimento sobre as
+  CPUs de P-core (em ordem crua, sem deduplicar por core físico) e depois
+  as E-cores; cls1 recebe o que sobra. Não há como usar --oracle-pin com
+  nosmt hoje: a lista de CPUs consideradas só inclui as online, mas o
+  número de tarefas continua fixo em nproc --all/2 — a diferença estoura o
+  índice e duas tarefas acabam presas ao mesmo CPU (double-booking). Por
+  isso --oracle-pin só é suportado com SMT ligado.
+
+5. ANÁLISE
+-----------
+Scripts em analysis/ (fora do venv do repo — precisam de numpy/matplotlib/
+scipy instalados à parte, ou de um venv próprio):
+  compare.py            — Welch t-test entre kernels, tabela + gráficos
+  placement_accuracy.py  — resumo de acurácia de placement por cenário
+  fig_results.py         — figura usada no artigo: um ponto por corrida,
+                            barra de média, Δ% de icas sobre asym_packing
+                            (aceita um 3º diretório opcional = oráculo)
+
+  Δ% = (valor_kernel − valor_baseline) / valor_baseline × 100, baseline é
+  sempre o kernel vanilla/asym_packing correspondente.
+
+
+6. REPRODUTIBILIDADE
+----------------------
+  Setup: ./setup_deps.sh  (detecta Arch Linux ou Debian/Ubuntu)
+  Execução (dentro de sched-bench/):
+    sudo ./run_battery.sh --kernel <tag> --outdir i5/<tag> --runs 50 \
+        --phases placement,throughput
+    sudo ./run_battery.sh --oracle-pin --kernel oracle_smt \
+        --outdir i5/oracle_pin --runs 50 --phases placement,throughput
+
+  Cada fase tem skip logic: se o arquivo de resultado já tem --runs (ou
+  2×--runs, para placement/throughput) amostras, a fase é pulada; execuções
+  interrompidas retomam do ponto onde pararam.
+
+  O preflight fixa o governor de CPU em "performance" e desliga o turbo
+  (Intel: intel_pstate/no_turbo=1) durante toda a bateria, restaurando ao
+  final. Ele NÃO fixa platform_profile, EPP (energy_performance_preference)
+  nem os limites RAPL — isso pode introduzir variação entre sessões se a
+  máquina estiver em perfis de energia diferentes (ex.: bateria vs. AC).
+
+
+7. LIMITAÇÕES CONHECIDAS
+--------------------------
+  - Com Hyper-Threading ligado, o registro de hardware (MSR) reporta classe 1
+    para as duas threads quando ambas estão ocupadas — o hardware não separa
+    por thread lógica, só por core físico. Isso NÃO significa que a classe
+    gravada fica errada: o filtro de acurácia e o debounce do ICAS impedem
+    que essa leitura colapsada seja gravada quando o irmão está ocupado. O
+    efeito real é disponibilidade reduzida do sinal sob SMT, não corrupção.
+
+  - rand48 (cls2) tem classificação instável mesmo isolado (~250 transições
+    em 5s), enquanto div16 (cls1) é praticamente monotônico. Ver
+    docs/ipcc_classes_behavior.txt para a tabela completa de estabilidade
+    por método.
+
+  - nosmt sobre-inscreve deliberadamente: o número de tarefas usa
+    nproc --all (fixo, não muda quando threads SMT ficam offline), então
+    nosmt roda a mesma carga em menos CPUs reais.
+
+  - --oracle-pin não é suportado com nosmt no momento (ver 4.3).
+
+  - Vazão varia ~0.5-1% entre sessões mesmo sem mudança de carga (efeito de
+    frequência/térmico). Comparações com diferença menor que isso não são
+    confiáveis sem repetir a sessão.
+
+  - Os patches IPCC foram portados manualmente para Linux 7.0.0-rc1; podem
+    existir divergências menores em relação à série original de Ricardo Neri.
+
+================================================================================
